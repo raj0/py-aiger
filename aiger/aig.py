@@ -7,12 +7,14 @@ from __future__ import annotations
 from abc import ABCMeta, abstractmethod
 import operator as op
 import pathlib
-from typing import Tuple, FrozenSet
+from typing import Tuple, FrozenSet, Optional
+import numpy as np
 
+import functools
 import attr
 import funcy as fn
-from pyrsistent import pmap
-from pyrsistent.typing import PMap
+from pyrsistent import pmap, pset, pvector
+from pyrsistent.typing import PMap, PSet
 
 import aiger as A
 from aiger import common as cmn
@@ -22,6 +24,13 @@ from aiger import writer
 
 @attr.frozen
 class Node(metaclass=ABCMeta):
+    count = 0
+    id : Optional[int] = attr.ib(hash=True)
+
+    def __init__(self):
+        object.__setattr__(self, "id", Node.count)
+        Node.count += 1
+
     def __and__(self, other: Node) -> Node:
         if self.is_false or other.is_false:
             return ConstFalse()
@@ -49,46 +58,92 @@ class Node(metaclass=ABCMeta):
     def children(self):
         pass
 
+    @property
+    def hashx(self):
+        return self.id
 
-@attr.frozen(cache_hash=True)
+    def __hash__(self):
+        print("hash called for ", self.id)
+        return self.id
+
+    def __eq__(self, other):
+        if isinstance(other, self.__class__):
+            print("eq called for ", self.id, " and ", other.id)
+            return self.id == other.id
+        else:
+            return False
+
+@attr.frozen
 class AndGate(Node):
     left: Node
     right: Node
+
+    def __init__(self, left, right):
+        super().__init__()
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
 
     @property
     def children(self):
         return (self.left, self.right)
 
+    @property
+    def hashx(self):
+        return self.id
 
 @attr.frozen
 class Inverter(Node):
     input: Node
 
+    def __init__(self, input):
+        super().__init__()
+        object.__setattr__(self, "input", input)
+
     @property
     def children(self):
         return (self.input, )
 
+    @property
+    def hashx(self):
+        return self.id
 
 @attr.frozen
 class Input(Node):
     name: str
 
+    def __init__(self, name):
+        super().__init__()
+        object.__setattr__(self, "name", name)
+
     @property
     def children(self):
         return ()
 
+    @property
+    def hashx(self):
+        return self.id
 
 @attr.frozen
 class LatchIn(Node):
     name: str
 
+    def __init__(self, name):
+        super().__init__()
+        object.__setattr__(self, "name", name)
+
     @property
     def children(self):
         return ()
 
+    @property
+    def hashx(self):
+        return self.id
 
 @attr.frozen
 class ConstFalse(Node):
+    def __init__(self):
+        super().__init__()
+
     @property
     def children(self):
         return ()
@@ -96,16 +151,16 @@ class ConstFalse(Node):
     def __eq__(self, other) -> bool:
         return isinstance(other, ConstFalse)
 
-    def __hash__(self) -> int:
-        return hash(False)
-
-
+    @property
+    def hashx(self):
+        return self.id
 @attr.frozen(repr=False)
 class AIG:
     inputs: FrozenSet[str] = frozenset()
-    node_map: PMap[str, Node] = attr.ib(default=pmap(), converter=pmap)
-    latch_map: PMap[str, Node] = attr.ib(default=pmap(), converter=pmap)
-    latch2init: PMap[str, bool] = attr.ib(default=pmap(), converter=pmap)
+    nodes : PMap[int, Node] = attr.field(default=pmap(), converter=pmap, repr=lambda x: x.hashx, init=True, hash=False)
+    node_map: PMap[int, Node] = attr.field(default=pmap(), converter=pmap, repr=lambda x: x.hashx, init=True, hash=False)
+    latch_map: PMap[int, Node] = attr.field(default=pmap(), converter=pmap, repr=lambda x: x.hashx, init=True, hash=False)
+    latch2init: PMap[int, bool] = attr.field(default=pmap(), init=True)
     comments: Tuple[str] = ()
 
     def __repr__(self):
@@ -143,19 +198,41 @@ class AIG:
 
     @property
     def outputs(self):
-        return frozenset(self.node_map.keys())
+        return set(self.node_map.keys())
 
     @property
     def latches(self):
-        return frozenset(self.latch2init.keys())
+        return set(self.latch2init.keys())
 
     @property
     def cones(self):
         return frozenset(self.node_map.values())
 
     @property
+    def cones_set(self):
+        return frozenset(self.node_map)
+
+    @property
     def latch_cones(self):
         return frozenset(self.latch_map.values())
+
+    @property
+    def latch_cones_set(self):
+        return frozenset(self.latch_map)
+
+    def get_node(self, id):
+        if id in self.latch_map:
+            return self.latch_map[id]
+        elif id in self.inputs:
+            return self.inputs[id]
+        elif id in self.node_map:
+            return self.node_map[id]
+        elif id in self.latch2init:
+            return self.latch2init[id]
+        elif id in self.nodes:
+            return self.nodes[id]
+        else:
+            return NotImplementedError
 
     def __rshift__(self, other):
         return seq_compose(self, other)
@@ -183,36 +260,33 @@ class AIG:
             and_, neg = op.and_, op.not_
         else:
             and_, neg = op.__and__, op.__invert__
-
         latchins = fn.merge(dict(self.latch2init), latches)
         # Remove latch inputs not used by self.
         latchins = fn.project(latchins, self.latches)
-
         latch_map = dict(self.latch_map)
-        boundary = set(self.node_map.values()) | set(latch_map.values())
-
         store, prev, mem = {}, set(), {}
+        latch_keys = [ x.id for x in self.latch_map.values() ]
+        node_keys = [ x.id for x in self.node_map.values() ]
         for node_batch in self.__iter_nodes__():
             prev = set(mem.keys()) - prev
             mem = fn.project(mem, prev)  # Forget about unnecessary gates.
-
             for gate in node_batch:
+                id = gate.id
                 if isinstance(gate, Inverter):
-                    mem[gate] = neg(mem[gate.input])
+                    mem[id] = neg(mem[gate.input.id])
                 elif isinstance(gate, AndGate):
-                    mem[gate] = and_(mem[gate.left], mem[gate.right])
+                    mem[id] = and_(mem[gate.left.id], mem[gate.right.id])
                 elif isinstance(gate, Input):
-                    mem[gate] = lift(inputs[gate.name])
+                    mem[id] = lift(inputs[gate.name])
                 elif isinstance(gate, LatchIn):
-                    mem[gate] = lift(latchins[gate.name])
+                    mem[id] = lift(latchins[gate.name])
                 elif isinstance(gate, ConstFalse):
-                    mem[gate] = lift(False)
+                    mem[id] = lift(False)
 
-                if gate in boundary:
-                    store[gate] = mem[gate]  # Store for eventual output.
-
-        outs = {out: store[gate] for out, gate in self.node_map.items()}
-        louts = {out: store[gate] for out, gate in latch_map.items()}
+                if (id in latch_keys) or (id in node_keys):
+                    store[id] = mem[id]  # Store for eventual output.
+        outs = {out: store[gate.id] for out, gate in self.node_map.items()}
+        louts = {out: store[gate.id] for out, gate in latch_map.items()}
         return outs, louts
 
     def simulator(self, latches=None):

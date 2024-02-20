@@ -381,9 +381,10 @@ def parse(stream):
 
     return A.aig.AIG(
         inputs=set(inputs),
-        node_map={n: lit2expr[lit] for n, lit in outputs.items()},
-        latch_map={n: lit2expr[latch.input] for n, latch in latches.items()},
-        latch2init={n: latch.init for n, latch in latches.items()},
+        nodes={ x.id : x for x in lit2expr.values() },
+        node_map= { k : lit2expr[v] for k,v in outputs.items() },
+        latch_map= { k : lit2expr[latch.input] for k, latch in latches.items() },
+        latch2init= { k : latch.init for k, latch in latches.items() },
         comments=tuple(state.comments if state.comments else []),
     )
 
